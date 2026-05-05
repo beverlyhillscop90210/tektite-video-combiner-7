@@ -167,12 +167,20 @@ class TektiteVideoCombiner7:
         temp_items: List[str] = []
         try:
             prepared_video_paths: List[str] = []
-            for unit in ordered_units:
+            for idx, unit in enumerate(ordered_units, start=1):
                 if unit["kind"] == "video":
+                    print(
+                        f"[Tektite Video Combiner 7.0] Clip {idx}/{len(ordered_units)} is video: "
+                        f"{unit.get('label', os.path.basename(unit['path']))}"
+                    )
                     prepared_video_paths.append(unit["path"])
                     if os.path.basename(unit["path"]).startswith("tektite_input_"):
                         temp_items.append(unit["path"])
                 else:
+                    print(
+                        f"[Tektite Video Combiner 7.0] Clip {idx}/{len(ordered_units)} is image sequence: "
+                        f"{len(unit['paths'])} frames -> rendering video"
+                    )
                     seq_video_path = self._render_image_sequence_to_video(
                         image_paths=unit["paths"],
                         fps=sequence_fps,
@@ -184,6 +192,10 @@ class TektiteVideoCombiner7:
                     )
                     prepared_video_paths.append(seq_video_path)
                     temp_items.append(seq_video_path)
+                    print(
+                        f"[Tektite Video Combiner 7.0] Clip {idx}/{len(ordered_units)} sequence render done: "
+                        f"{seq_video_path}"
+                    )
 
             stitched_output = self._ffmpeg_stitch(
                 ordered_paths=prepared_video_paths,
@@ -324,14 +336,14 @@ class TektiteVideoCombiner7:
             slot_index = int(match.group(1))
             raw_paths = self._extract_paths_from_value(value)
             paths = [self._normalize_path(p) for p in raw_paths]
+            paths = self._expand_directory_sequences(paths)
             paths = [p for p in paths if p]
             if not paths:
                 per_slot_paths.setdefault(slot_index, [])
                 continue
 
-            per_slot_paths.setdefault(slot_index, []).extend(paths)
-
             if self._all_images(paths):
+                per_slot_paths.setdefault(slot_index, []).extend(paths)
                 units.append(
                     (
                         slot_index,
@@ -347,8 +359,10 @@ class TektiteVideoCombiner7:
                 seq += 1
                 continue
 
+            recognized_paths: List[str] = []
             for p in paths:
                 if self._is_video_file(p):
+                    recognized_paths.append(p)
                     units.append(
                         (
                             slot_index,
@@ -363,6 +377,7 @@ class TektiteVideoCombiner7:
                     )
                     seq += 1
                 elif self._is_image_file(p):
+                    recognized_paths.append(p)
                     units.append(
                         (
                             slot_index,
@@ -376,6 +391,27 @@ class TektiteVideoCombiner7:
                         )
                     )
                     seq += 1
+                elif os.path.isfile(p):
+                    # Some Comfy wrappers return valid video temp files without a useful extension.
+                    recognized_paths.append(p)
+                    units.append(
+                        (
+                            slot_index,
+                            seq,
+                            {
+                                "kind": "video",
+                                "path": p,
+                                "label": os.path.basename(p),
+                                "slot": slot_index,
+                            },
+                        )
+                    )
+                    seq += 1
+
+            if recognized_paths:
+                per_slot_paths.setdefault(slot_index, []).extend(recognized_paths)
+            else:
+                per_slot_paths.setdefault(slot_index, [])
 
         missing_slots: List[str] = []
         for i in range(1, expected_clips + 1):
@@ -388,6 +424,20 @@ class TektiteVideoCombiner7:
         # Do not deduplicate: repeated paths may be intentional.
         out: List[Dict[str, Any]] = [unit for _, _, unit in units]
         return out, missing_slots
+
+    def _expand_directory_sequences(self, paths: List[str]) -> List[str]:
+        expanded: List[str] = []
+        for path in paths:
+            if path and os.path.isdir(path):
+                try:
+                    names = os.listdir(path)
+                except OSError:
+                    names = []
+                images = [os.path.join(path, name) for name in names if self._is_image_file(name)]
+                expanded.extend(self._sort_image_paths(images))
+            else:
+                expanded.append(path)
+        return expanded
 
     def _missing_files_for_units(self, units: List[Dict[str, Any]]) -> List[str]:
         missing: List[str] = []
@@ -508,6 +558,10 @@ class TektiteVideoCombiner7:
                 if isinstance(source, str) and source.strip():
                     return [source.strip()]
 
+                source_paths = self._extract_paths_from_value(source, _depth + 1, _seen)
+                if source_paths:
+                    return source_paths
+
                 # In-memory stream source (BytesIO, etc.): write bytes directly to temp once.
                 stream_path = self._persist_stream_source_to_temp(source, owner=value)
                 if stream_path:
@@ -525,12 +579,14 @@ class TektiteVideoCombiner7:
                 print(f"[Tektite Video Combiner 7.0] save_to fallback failed: {type(exc).__name__}: {exc}")
 
         # Generic object fallback: common path-like attributes.
-        for attr in ("path", "file", "filename", "fullpath"):
+        for attr in ("path", "file", "filename", "fullpath", "filepath", "file_path", "source", "stream_source"):
             candidate = getattr(value, attr, None)
             if isinstance(candidate, os.PathLike):
                 candidate = os.fspath(candidate)
             if isinstance(candidate, str) and candidate.strip():
                 paths.append(candidate.strip())
+            elif candidate is not None:
+                paths.extend(self._extract_paths_from_value(candidate, _depth + 1, _seen))
 
         # Recursive object-wrapper fallback for common wrapper attrs.
         for attr in ("value", "data", "video", "clip", "item"):
@@ -675,6 +731,10 @@ class TektiteVideoCombiner7:
         work_dir = tempfile.mkdtemp(prefix="tektite_seq_")
         list_path = os.path.join(work_dir, "images.txt")
         out_path = os.path.join(work_dir, f"sequence.{output_format}")
+        print(
+            f"[Tektite Video Combiner 7.0] Rendering image sequence: "
+            f"{len(image_paths)} frames at {float(fps):.2f} fps -> {out_path}"
+        )
 
         frame_duration = 1.0 / max(fps, 1.0)
         with open(list_path, "w", encoding="utf-8") as f:
@@ -712,6 +772,7 @@ class TektiteVideoCombiner7:
         if result.returncode != 0:
             raise RuntimeError(f"FFmpeg image-sequence encode failed.\n{result.stderr.strip()}")
 
+        print(f"[Tektite Video Combiner 7.0] Image sequence video ready: {out_path}")
         return out_path
 
     def _ffmpeg_stitch(
