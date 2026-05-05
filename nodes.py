@@ -1,3 +1,4 @@
+import glob
 import os
 import re
 import shutil
@@ -98,6 +99,7 @@ class TektiteVideoCombiner7:
         self._runtime_image_cache: Dict[int, List[str]] = {}
         self._runtime_temp_inputs: List[str] = []
         self._runtime_temp_dirs: List[str] = []
+        self._runtime_unrecognized_slots = set()
         expected_clips = self._infer_expected_clips(kwargs)
         if expected_clips < 1:
             raise ValueError("No clip inputs connected. Connect at least clip1.")
@@ -318,13 +320,61 @@ class TektiteVideoCombiner7:
             m = pattern.match(str(key))
             if not m:
                 continue
-            # treat connected/meaningful slots as expected
-            if value is None:
+            # Comfy can pass placeholder-ish values for wildcard slots. Only count
+            # inputs that look like an actual clip source.
+            if not self._has_clip_content(value):
                 continue
             idx = int(m.group(1))
             if idx > max_idx:
                 max_idx = idx
         return max_idx
+
+    def _has_clip_content(self, value: Any, _depth: int = 0, _seen: Optional[set] = None) -> bool:
+        if value is None:
+            return False
+        if _depth > 5:
+            return False
+        if _seen is None:
+            _seen = set()
+
+        obj_id = id(value)
+        if obj_id in _seen:
+            return False
+        _seen.add(obj_id)
+
+        if self._is_image_tensor(value):
+            return True
+        if isinstance(value, os.PathLike):
+            value = os.fspath(value)
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, dict):
+            for key in ("fullpath", "path", "filename", "video_url", "url"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return True
+            return any(self._has_clip_content(candidate, _depth + 1, _seen) for candidate in value.values())
+        if isinstance(value, (tuple, list)):
+            return any(self._has_clip_content(candidate, _depth + 1, _seen) for candidate in value)
+        if hasattr(value, "get_stream_source") or hasattr(value, "save_to"):
+            return True
+
+        for attr in ("path", "file", "filename", "fullpath", "filepath", "file_path", "source", "stream_source"):
+            candidate = getattr(value, attr, None)
+            if isinstance(candidate, os.PathLike):
+                candidate = os.fspath(candidate)
+            if isinstance(candidate, str) and candidate.strip():
+                return True
+            if candidate is not None and self._has_clip_content(candidate, _depth + 1, _seen):
+                return True
+
+        for attr in ("value", "data", "video", "clip", "item", "image", "images", "frames"):
+            if hasattr(value, attr):
+                candidate = getattr(value, attr, None)
+                if self._has_clip_content(candidate, _depth + 1, _seen):
+                    return True
+
+        return False
 
     def _collect_clip_units(
         self, dynamic_inputs: Dict[str, Any], *, expected_clips: int
@@ -366,6 +416,7 @@ class TektiteVideoCombiner7:
             paths = self._expand_directory_sequences(paths)
             paths = [p for p in paths if p]
             if not paths:
+                self._log_unrecognized_clip_input(slot_index, value)
                 per_slot_paths.setdefault(slot_index, [])
                 continue
 
@@ -465,6 +516,12 @@ class TektiteVideoCombiner7:
                 found = self._extract_image_tensor_from_value(candidate)
                 if found is not None:
                     return found
+        else:
+            for attr in ("image", "images", "frames", "value", "data"):
+                if hasattr(value, attr):
+                    found = self._extract_image_tensor_from_value(getattr(value, attr, None))
+                    if found is not None:
+                        return found
         return None
 
     def _is_image_tensor(self, value: Any) -> bool:
@@ -526,7 +583,10 @@ class TektiteVideoCombiner7:
     def _expand_directory_sequences(self, paths: List[str]) -> List[str]:
         expanded: List[str] = []
         for path in paths:
-            if path and os.path.isdir(path):
+            if path and self._has_glob_chars(path):
+                matches = [p for p in glob.glob(path) if self._is_video_file(p) or self._is_image_file(p)]
+                expanded.extend(self._sort_image_paths(matches))
+            elif path and os.path.isdir(path):
                 try:
                     names = os.listdir(path)
                 except OSError:
@@ -630,12 +690,19 @@ class TektiteVideoCombiner7:
             return paths
 
         if isinstance(value, dict):
+            comfy_image_path = self._path_from_comfy_image_dict(value)
+            if comfy_image_path:
+                paths.append(comfy_image_path)
             for key in ("fullpath", "path", "filename", "video_url", "url"):
+                if comfy_image_path and key == "filename":
+                    continue
                 candidate = value.get(key)
                 if isinstance(candidate, str) and candidate.strip():
                     paths.append(candidate.strip())
             # Recursive fallback for wrapped structures.
-            for candidate in value.values():
+            for key, candidate in value.items():
+                if key in ("filename", "subfolder", "type"):
+                    continue
                 paths.extend(self._extract_paths_from_value(candidate, _depth + 1, _seen))
             return self._dedupe_keep_order(paths)
 
@@ -689,12 +756,37 @@ class TektiteVideoCombiner7:
                 paths.extend(self._extract_paths_from_value(candidate, _depth + 1, _seen))
 
         # Recursive object-wrapper fallback for common wrapper attrs.
-        for attr in ("value", "data", "video", "clip", "item"):
+        for attr in ("value", "data", "video", "clip", "item", "image", "images", "frames"):
             if hasattr(value, attr):
                 candidate = getattr(value, attr, None)
                 paths.extend(self._extract_paths_from_value(candidate, _depth + 1, _seen))
 
         return self._dedupe_keep_order(paths)
+
+    def _path_from_comfy_image_dict(self, value: Dict[str, Any]) -> str:
+        filename = value.get("filename")
+        if not isinstance(filename, str) or not filename.strip():
+            return ""
+
+        subfolder = value.get("subfolder", "")
+        if not isinstance(subfolder, str):
+            subfolder = ""
+        folder_type = value.get("type", "input")
+        if not isinstance(folder_type, str):
+            folder_type = "input"
+
+        rel_path = os.path.join(subfolder.strip(), filename.strip()) if subfolder.strip() else filename.strip()
+        if os.path.isabs(rel_path):
+            return rel_path
+
+        folder_type = folder_type.lower().strip()
+        if folder_type == "output":
+            base_dir = folder_paths.get_output_directory()
+        elif folder_type == "temp" and hasattr(folder_paths, "get_temp_directory"):
+            base_dir = folder_paths.get_temp_directory()
+        else:
+            base_dir = folder_paths.get_input_directory()
+        return os.path.abspath(os.path.join(base_dir, rel_path))
 
     def _persist_stream_source_to_temp(self, source: Any, *, owner: Any) -> str:
         cache_key = (id(owner), id(source), "stream")
@@ -778,6 +870,17 @@ class TektiteVideoCombiner7:
         if candidate.startswith(("http://", "https://")):
             return candidate
 
+        if self._has_glob_chars(candidate):
+            if os.path.isabs(candidate):
+                return candidate
+            out_pattern = os.path.abspath(os.path.join(folder_paths.get_output_directory(), candidate))
+            if glob.glob(out_pattern):
+                return out_pattern
+            inp_pattern = os.path.abspath(os.path.join(folder_paths.get_input_directory(), candidate))
+            if glob.glob(inp_pattern):
+                return inp_pattern
+            return out_pattern
+
         if os.path.isabs(candidate):
             return candidate
 
@@ -796,6 +899,37 @@ class TektiteVideoCombiner7:
 
     def _is_image_file(self, path: str) -> bool:
         return os.path.splitext(path)[1].lower() in IMAGE_EXTS
+
+    def _has_glob_chars(self, path: str) -> bool:
+        return any(ch in path for ch in ("*", "?", "["))
+
+    def _log_unrecognized_clip_input(self, slot_index: int, value: Any) -> None:
+        seen = getattr(self, "_runtime_unrecognized_slots", set())
+        if slot_index in seen:
+            return
+        seen.add(slot_index)
+        self._runtime_unrecognized_slots = seen
+        print(
+            f"[Tektite Video Combiner 7.0] clip{slot_index}: input connected but not recognized "
+            f"as VIDEO/path/IMAGE/image-list. Debug: {self._summarize_value(value)}"
+        )
+
+    def _summarize_value(self, value: Any) -> str:
+        if value is None:
+            return "None"
+        if isinstance(value, torch.Tensor):
+            return f"torch.Tensor shape={tuple(value.shape)}"
+        if isinstance(value, dict):
+            keys = list(value.keys())[:8]
+            return f"dict keys={keys}"
+        if isinstance(value, (list, tuple)):
+            first = self._summarize_value(value[0]) if value else "empty"
+            return f"{type(value).__name__} len={len(value)} first={first}"
+        attrs = []
+        for attr in ("path", "filename", "subfolder", "type", "value", "data", "video", "image", "images"):
+            if hasattr(value, attr):
+                attrs.append(attr)
+        return f"{type(value).__module__}.{type(value).__name__} attrs={attrs[:8]}"
 
     def _all_images(self, paths: List[str]) -> bool:
         return len(paths) > 0 and all(self._is_image_file(p) for p in paths)

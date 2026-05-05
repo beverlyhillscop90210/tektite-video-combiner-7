@@ -7,7 +7,7 @@ Standalone ComfyUI custom node variant with a new class name so it can be instal
 
 ## Key Features
 - `clip1..clip16` inputs
-- Accepts videos, image sequences, image folders, and Comfy `IMAGE` batches
+- Accepts video paths, `.mp4`, single `.png`, PNG folders/globs, image sequences, and Comfy `IMAGE` batches
 - Preserves input slot order (`clip1`, `clip2`, ...)
 - Wait/poll logic with timeout and stable polls
 - Optional `audio` input for final mux
