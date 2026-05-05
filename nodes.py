@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import folder_paths
 import torch
+from PIL import Image
 
 try:
     from comfy_api.latest import InputImpl
@@ -94,7 +95,9 @@ class TektiteVideoCombiner7:
             raise RuntimeError("This node needs a recent ComfyUI build with native VIDEO support.")
         # Runtime cache for in-memory VIDEO inputs (no filesystem path).
         self._runtime_video_cache: Dict[int, str] = {}
+        self._runtime_image_cache: Dict[int, List[str]] = {}
         self._runtime_temp_inputs: List[str] = []
+        self._runtime_temp_dirs: List[str] = []
         expected_clips = self._infer_expected_clips(kwargs)
         if expected_clips < 1:
             raise ValueError("No clip inputs connected. Connect at least clip1.")
@@ -225,6 +228,9 @@ class TektiteVideoCombiner7:
             for item in temp_items:
                 if os.path.exists(item):
                     os.remove(item)
+            for d in getattr(self, "_runtime_temp_dirs", []):
+                if d and os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
 
     def _build_progress_line(
         self,
@@ -334,6 +340,27 @@ class TektiteVideoCombiner7:
                 continue
 
             slot_index = int(match.group(1))
+            image_tensor = self._extract_image_tensor_from_value(value)
+            if image_tensor is not None:
+                image_paths = self._persist_image_tensor_sequence(image_tensor, slot_index=slot_index)
+                if image_paths:
+                    per_slot_paths.setdefault(slot_index, []).extend(image_paths)
+                    units.append(
+                        (
+                            slot_index,
+                            seq,
+                            {
+                                "kind": "image_sequence",
+                                "paths": image_paths,
+                                "label": f"clip{slot_index}_image_batch",
+                                "slot": slot_index,
+                                "memory_sequence": True,
+                            },
+                        )
+                    )
+                    seq += 1
+                    continue
+
             raw_paths = self._extract_paths_from_value(value)
             paths = [self._normalize_path(p) for p in raw_paths]
             paths = self._expand_directory_sequences(paths)
@@ -425,6 +452,77 @@ class TektiteVideoCombiner7:
         out: List[Dict[str, Any]] = [unit for _, _, unit in units]
         return out, missing_slots
 
+    def _extract_image_tensor_from_value(self, value: Any) -> Optional[torch.Tensor]:
+        if self._is_image_tensor(value):
+            return value
+        if isinstance(value, dict):
+            for candidate in value.values():
+                found = self._extract_image_tensor_from_value(candidate)
+                if found is not None:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for candidate in value:
+                found = self._extract_image_tensor_from_value(candidate)
+                if found is not None:
+                    return found
+        return None
+
+    def _is_image_tensor(self, value: Any) -> bool:
+        if not isinstance(value, torch.Tensor):
+            return False
+        if value.ndim not in (3, 4):
+            return False
+        shape = tuple(int(x) for x in value.shape)
+        if value.ndim == 3:
+            return shape[-1] in (1, 3, 4) or shape[0] in (1, 3, 4)
+        return shape[-1] in (1, 3, 4) or shape[1] in (1, 3, 4)
+
+    def _persist_image_tensor_sequence(self, tensor: torch.Tensor, *, slot_index: int) -> List[str]:
+        cache_key = id(tensor)
+        cached = getattr(self, "_runtime_image_cache", {}).get(cache_key)
+        if cached and all(os.path.exists(p) for p in cached):
+            return cached
+
+        frames = tensor.detach().float().clamp(0.0, 1.0)
+        if frames.ndim == 3:
+            if frames.shape[-1] in (1, 3, 4):
+                frames = frames.unsqueeze(0)
+            elif frames.shape[0] in (1, 3, 4):
+                frames = frames.permute(1, 2, 0).unsqueeze(0)
+            else:
+                return []
+        elif frames.ndim == 4:
+            if frames.shape[-1] in (1, 3, 4):
+                pass
+            elif frames.shape[1] in (1, 3, 4):
+                frames = frames.permute(0, 2, 3, 1)
+            else:
+                return []
+        else:
+            return []
+
+        frame_count = int(frames.shape[0])
+        if frame_count < 1:
+            return []
+
+        work_dir = tempfile.mkdtemp(prefix=f"tektite_clip{slot_index}_frames_")
+        self._runtime_temp_dirs.append(work_dir)
+        paths: List[str] = []
+        print(
+            f"[Tektite Video Combiner 7.0] clip{slot_index}: received IMAGE batch with "
+            f"{frame_count} frames -> temporary image sequence"
+        )
+        for frame_index in range(frame_count):
+            frame = (frames[frame_index].cpu().numpy() * 255.0).round().astype("uint8")
+            if frame.shape[-1] == 1:
+                frame = frame[:, :, 0]
+            path = os.path.join(work_dir, f"frame_{frame_index:06d}.png")
+            Image.fromarray(frame).save(path)
+            paths.append(path)
+
+        self._runtime_image_cache[cache_key] = paths
+        return paths
+
     def _expand_directory_sequences(self, paths: List[str]) -> List[str]:
         expanded: List[str] = []
         for path in paths:
@@ -467,6 +565,8 @@ class TektiteVideoCombiner7:
         unstable: List[str] = []
         local_paths: List[str] = []
         for unit in clip_units:
+            if unit.get("memory_sequence"):
+                continue
             if unit["kind"] == "video":
                 path = unit["path"]
                 if not path.startswith(("http://", "https://")):
@@ -729,6 +829,7 @@ class TektiteVideoCombiner7:
             raise ValueError("Empty image sequence received.")
 
         work_dir = tempfile.mkdtemp(prefix="tektite_seq_")
+        self._runtime_temp_dirs.append(work_dir)
         list_path = os.path.join(work_dir, "images.txt")
         out_path = os.path.join(work_dir, f"sequence.{output_format}")
         print(
